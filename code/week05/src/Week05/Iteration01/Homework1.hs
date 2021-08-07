@@ -15,72 +15,71 @@ module Week05.Homework1 where
 import           Control.Monad              hiding (fmap)
 import           Control.Monad.Freer.Extras as Extras
 import           Data.Aeson                 (ToJSON, FromJSON)
-import           Data.Default               (Default (..))
 import           Data.Text                  (Text)
 import           Data.Void                  (Void)
 import           GHC.Generics               (Generic)
-import           Plutus.Contract            as Contract
+import           Plutus.Contract            as Contract hiding (when)
 import           Plutus.Trace.Emulator      as Emulator
 import qualified PlutusTx
 import           PlutusTx.Prelude           hiding (Semigroup(..), unless)
-import           Ledger                     hiding (mint, singleton)
+import           Ledger                     hiding (singleton)
 import           Ledger.Constraints         as Constraints
-import           Ledger.TimeSlot
 import qualified Ledger.Typed.Scripts       as Scripts
 import           Ledger.Value               as Value
 import           Playground.Contract        (printJson, printSchemas, ensureKnownCurrencies, stage, ToSchema)
 import           Playground.TH              (mkKnownCurrencies, mkSchemaDefinitions)
 import           Playground.Types           (KnownCurrency (..))
-import           Prelude                    (IO, Semigroup (..), Show (..), String, undefined)
+import           Prelude                    (Semigroup (..))
 import           Text.Printf                (printf)
 import           Wallet.Emulator.Wallet
 
 {-# INLINABLE mkPolicy #-}
 -- This policy should only allow minting (or burning) of tokens if the owner of the specified PubKeyHash
 -- has signed the transaction and if the specified deadline has not passed.
-mkPolicy :: PubKeyHash -> POSIXTime -> () -> ScriptContext -> Bool
-mkPolicy pkh d () ctx = traceIfFalse "UTxO not consumed"    hasSigned &&
-                        traceIfFalse "deadline has passed"  deadline
+mkPolicy :: PubKeyHash -> Slot -> ScriptContext -> Bool
+mkPolicy pkh deadline ctx =
+    traceIfFalse "beneficiary's signature missing" checkSig      &&
+    traceIfFalse "deadline passed"                 checkDeadline
   where
     info :: TxInfo
     info = scriptContextTxInfo ctx
+    checkSig :: Bool
+    checkSig = txSignedBy info pkh
+    checkDeadline :: Bool
+    checkDeadline = to deadline `contains` txInfoValidRange info
 
-    hasSigned :: Bool
-    hasSigned = txSignedBy info pkh
-
-    deadline :: Bool
-    deadline = contains (to d) $ txInfoValidRange info
-
-policy :: PubKeyHash -> POSIXTime -> Scripts.MintingPolicy
-policy pkh d = mkMintingPolicyScript $
-    $$(PlutusTx.compile [|| \pkh' d' -> Scripts.wrapMintingPolicy $ mkPolicy pkh' d' ||])
+policy :: PubKeyHash -> Slot -> Scripts.MonetaryPolicy
+policy pkh deadline = mkMonetaryPolicyScript $
+    $$(PlutusTx.compile [|| \pkh' deadline' -> Scripts.wrapMonetaryPolicy $ mkPolicy pkh' deadline' ||])
     `PlutusTx.applyCode`
     PlutusTx.liftCode pkh
     `PlutusTx.applyCode`
-    PlutusTx.liftCode d
+    PlutusTx.liftCode deadline
 
-curSymbol :: PubKeyHash -> POSIXTime -> CurrencySymbol
-curSymbol pkh d = scriptCurrencySymbol $ policy pkh d
+curSymbol :: PubKeyHash -> Slot -> CurrencySymbol
+curSymbol pkh deadline = scriptCurrencySymbol $ policy pkh deadline
 
 data MintParams = MintParams
     { mpTokenName :: !TokenName
-    , mpDeadline  :: !POSIXTime
+    , mpDeadline  :: !Slot
     , mpAmount    :: !Integer
     } deriving (Generic, ToJSON, FromJSON, ToSchema)
 
-type SignedSchema = Endpoint "mint" MintParams
+type SignedSchema =
+    BlockchainActions
+        .\/ Endpoint "mint" MintParams
 
 mint :: MintParams -> Contract w SignedSchema Text ()
 mint mp = do
     pkh <- pubKeyHash <$> Contract.ownPubKey
-    now <- Contract.currentTime
+    now <- Contract.currentSlot
     let deadline = mpDeadline mp
     if now > deadline
         then Contract.logError @String "deadline passed"
         else do
             let val     = Value.singleton (curSymbol pkh deadline) (mpTokenName mp) (mpAmount mp)
-                lookups = Constraints.mintingPolicy $ policy pkh deadline
-                tx      = Constraints.mustMintValue val <> Constraints.mustValidateIn (to $ now + 5000)
+                lookups = Constraints.monetaryPolicy $ policy pkh deadline
+                tx      = Constraints.mustForgeValue val <> Constraints.mustValidateIn (to deadline)
             ledgerTx <- submitTxConstraintsWith @Void lookups tx
             void $ awaitTxConfirmed $ txId ledgerTx
             Contract.logInfo @String $ printf "forged %s" (show val)
@@ -97,7 +96,7 @@ mkKnownCurrencies []
 test :: IO ()
 test = runEmulatorTraceIO $ do
     let tn       = "ABC"
-        deadline = slotToBeginPOSIXTime def 10
+        deadline = 10
     h <- activateContractWallet (Wallet 1) endpoints
     callEndpoint @"mint" h $ MintParams
         { mpTokenName = tn

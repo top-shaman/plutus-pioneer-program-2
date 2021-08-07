@@ -10,8 +10,6 @@
 {-# LANGUAGE TypeFamilies        #-}
 {-# LANGUAGE TypeOperators       #-}
 
-{-# OPTIONS_GHC -fno-warn-unused-imports #-}
-
 module Week02.Homework2 where
 
 import           Control.Monad        hiding (fmap)
@@ -20,17 +18,19 @@ import           Data.Map             as Map
 import           Data.Text            (Text)
 import           Data.Void            (Void)
 import           GHC.Generics         (Generic)
-import           Plutus.Contract
+import           Plutus.Contract      hiding (when)
+import           PlutusTx             (Data (..))
 import qualified PlutusTx
 import           PlutusTx.Prelude     hiding (Semigroup(..), unless)
 import           Ledger               hiding (singleton)
 import           Ledger.Constraints   as Constraints
+import qualified Ledger.Scripts       as Scripts
 import qualified Ledger.Typed.Scripts as Scripts
 import           Ledger.Ada           as Ada
 import           Playground.Contract  (printJson, printSchemas, ensureKnownCurrencies, stage, ToSchema)
 import           Playground.TH        (mkKnownCurrencies, mkSchemaDefinitions)
 import           Playground.Types     (KnownCurrency (..))
-import           Prelude              (IO, Semigroup (..), String, undefined)
+import           Prelude              (Semigroup (..))
 import           Text.Printf          (printf)
 
 data MyRedeemer = MyRedeemer
@@ -41,50 +41,51 @@ data MyRedeemer = MyRedeemer
 PlutusTx.unstableMakeIsData ''MyRedeemer
 
 {-# INLINABLE mkValidator #-}
--- This should validate if and only if the two Booleans in the redeemer are equal!
-mkValidator :: () -> MyRedeemer -> ScriptContext -> Bool
-mkValidator _ r _ = traceIfFalse "redeemers not equal" $ (flag1 r == flag2 r)
+mkValidator :: () -> MyRedeemer -> ValidatorCtx -> Bool
+mkValidator () (MyRedeemer flag1 flag2) _ = traceIfFalse "wrong redeemer" $ flag1 == flag2
 
 data Typed
-instance Scripts.ValidatorTypes Typed where
-    type instance DatumType Typed = ()
+instance Scripts.ScriptType Typed where
+    type instance DatumType Typed    = ()
     type instance RedeemerType Typed = MyRedeemer
 
-typedValidator :: Scripts.TypedValidator Typed
-typedValidator = Scripts.mkTypedValidator @Typed
+inst :: Scripts.ScriptInstance Typed
+inst = Scripts.validator @Typed
     $$(PlutusTx.compile [|| mkValidator ||])
     $$(PlutusTx.compile [|| wrap ||])
   where
-    wrap = Scripts.wrapValidator @() @MyRedeemer
+    wrap = Scripts.wrapValidator @() @MyRedeemer    
+
 
 validator :: Validator
-validator = Scripts.validatorScript typedValidator
+validator = Scripts.validatorScript inst
 
 valHash :: Ledger.ValidatorHash
-valHash = Scripts.validatorHash typedValidator
+valHash = Scripts.validatorHash validator
 
 scrAddress :: Ledger.Address
-scrAddress = scriptAddress validator
+scrAddress = ScriptAddress valHash
 
 type GiftSchema =
-            Endpoint "give" Integer
+    BlockchainActions
+        .\/ Endpoint "give" Integer
         .\/ Endpoint "grab" MyRedeemer
 
-give :: AsContractError e => Integer -> Contract w s e ()
+give :: (HasBlockchainActions s, AsContractError e) => Integer -> Contract w s e ()
 give amount = do
     let tx = mustPayToTheScript () $ Ada.lovelaceValueOf amount
-    ledgerTx <- submitTxConstraints typedValidator tx
+    ledgerTx <- submitTxConstraints inst tx
     void $ awaitTxConfirmed $ txId ledgerTx
     logInfo @String $ printf "made a gift of %d lovelace" amount
 
-grab :: forall w s e. AsContractError e => MyRedeemer -> Contract w s e ()
-grab r = do
+grab :: forall w s e. (HasBlockchainActions s, AsContractError e) => MyRedeemer -> Contract w s e ()
+grab (MyRedeemer flag1 flag2) = do -- could just be single variable thanks to polymorphism
     utxos <- utxoAt scrAddress
     let orefs   = fst <$> Map.toList utxos
         lookups = Constraints.unspentOutputs utxos      <>
                   Constraints.otherScript validator
         tx :: TxConstraints Void Void
-        tx      = mconcat [mustSpendScriptOutput oref $ Redeemer $ PlutusTx.toData r | oref <- orefs]
+        tx      = mconcat [mustSpendScriptOutput oref $ Redeemer $ PlutusTx.toData (MyRedeemer flag1 flag2 ) | oref <- orefs] -- doesn't have to be (MyRedeemer flag1 flag2) could just be one polymorphic redeemer variable
     ledgerTx <- submitTxConstraintsWith @Void lookups tx
     void $ awaitTxConfirmed $ txId ledgerTx
     logInfo @String $ "collected gifts"
